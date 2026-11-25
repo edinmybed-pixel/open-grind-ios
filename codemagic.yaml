@@ -1,0 +1,112 @@
+workflows:
+  ios-sideload:
+    name: Open Grind sideload IPA
+    # Free personal tier: Mac mini M2, 500 min/month, 120 min max per build.
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      # Codemagic's Xcode 27.0 is build 27A266a, the exact build upstream pins.
+      xcode: 27.0
+      vars:
+        UPSTREAM_URL: https://git.opengrind.org/open-grind/open-grind.git
+        UPSTREAM_REF: main
+        PINNED_XCODE_BUILD: 27A266a
+        PINNED_SDK_BUILD: 24A430
+    scripts:
+      - name: Select Xcode 27.0 and check the host
+        script: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sudo xcode-select -s /Applications/Xcode-27.0.app/Contents/Developer
+          xcodebuild -version
+          xcode_build=$(xcodebuild -version | awk '/Build version/ {print $3}')
+          sdk_build=$(xcrun --sdk iphoneos --show-sdk-build-version)
+          echo "Xcode build: $xcode_build  iOS SDK build: $sdk_build"
+          if [ "$xcode_build" != "$PINNED_XCODE_BUILD" ]; then
+            echo "Xcode build is $xcode_build, upstream needs $PINNED_XCODE_BUILD" >&2
+            exit 1
+          fi
+          echo "SDK_BUILD=$sdk_build" >> "$CM_ENV"
+          sw_vers; sysctl -n hw.ncpu hw.memsize; df -h "$CM_BUILD_DIR"
+
+      - name: Install Nix
+        script: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
+            | sh -s -- install --no-confirm
+          echo "PATH=/nix/var/nix/profiles/default/bin:$PATH" >> "$CM_ENV"
+          /nix/var/nix/profiles/default/bin/nix --version
+
+      - name: Clone upstream
+        script: |
+          set -euo pipefail
+          SRC="$CM_BUILD_DIR/open-grind"
+          # Full clone: nix reads the flake through libgit2, which rejects
+          # shallow and partial clones.
+          git clone "$UPSTREAM_URL" "$SRC"
+          cd "$SRC"
+          git checkout --quiet "$UPSTREAM_REF"
+          git submodule update --init --recursive
+          git log -1 --format='Building upstream %H (%cd) %s'
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$CM_ENV"
+
+      - name: Accept the machine's iOS SDK build if it differs from the pin
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/open-grind"
+          if [ "$SDK_BUILD" = "$PINNED_SDK_BUILD" ]; then
+            echo "iOS SDK build matches the pin ($SDK_BUILD)"; exit 0
+          fi
+          echo "iOS SDK build is $SDK_BUILD, upstream pins $PINNED_SDK_BUILD; accepting it (IPA works, just not byte-identical to an official one)"
+          sed -i '' "s/IPHONEOS_SDK_BUILD = \"$PINNED_SDK_BUILD\"/IPHONEOS_SDK_BUILD = \"$SDK_BUILD\"/" scripts/ios/sideload.ts
+          grep -n IPHONEOS_SDK_BUILD scripts/ios/sideload.ts
+          # The nix build refuses a dirty checkout, so record the change.
+          git -c user.name=ci -c user.email=ci@localhost commit -qam "ci: accept iOS SDK $SDK_BUILD"
+
+      - name: Build sideload IPA (nix run .#build-ios)
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/open-grind"
+          start=$(date +%s)
+          nix run .#build-ios
+          echo "build took $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Inspect IPA
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/open-grind"
+          shopt -s nullglob
+          ipas=(src-tauri/target/release/artifacts/*.ipa)
+          if [ ${#ipas[@]} -ne 1 ]; then
+            echo "expected exactly one IPA, found ${#ipas[@]}" >&2
+            ls -la src-tauri/target/release/artifacts || true
+            exit 1
+          fi
+          ipa="${ipas[0]}"
+          out="$CM_BUILD_DIR/out"
+          mkdir -p "$out"
+          cp "$ipa" "$out/"
+          check="$(mktemp -d)"
+          unzip -q "$ipa" -d "$check"
+          app=$(find "$check/Payload" -maxdepth 1 -name '*.app' -type d | head -1)
+          exe=$(plutil -extract CFBundleExecutable raw -o - "$app/Info.plist")
+          {
+            echo "IPA: $(basename "$ipa")"
+            echo "upstream: $UPSTREAM_SHA"
+            echo "size: $(stat -f %z "$ipa") bytes"
+            echo "sha256: $(shasum -a 256 "$ipa" | cut -d' ' -f1)"
+            echo "bundle id: $(plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist")"
+            echo "version: $(plutil -extract CFBundleShortVersionString raw -o - "$app/Info.plist") ($(plutil -extract CFBundleVersion raw -o - "$app/Info.plist"))"
+            echo "min iOS: $(plutil -extract MinimumOSVersion raw -o - "$app/Info.plist")"
+            echo "platform: $(plutil -extract DTPlatformName raw -o - "$app/Info.plist") SDK $(plutil -extract DTSDKBuild raw -o - "$app/Info.plist") Xcode $(plutil -extract DTXcodeBuild raw -o - "$app/Info.plist")"
+            echo "executable: $(file "$app/$exe")"
+            echo "archs: $(lipo -archs "$app/$exe")"
+            echo "mach-o platform:"; otool -l "$app/$exe" | grep -A4 LC_BUILD_VERSION | head -5
+            echo "signature:"; codesign -dv "$app" 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier' || true
+          } | tee "$out/inspection.txt"
+          lipo -archs "$app/$exe" | grep -qw arm64
+          otool -l "$app/$exe" | grep -A4 LC_BUILD_VERSION | grep -qE 'platform (2|IOS)\b'
+          codesign --verify --deep --strict "$app"
+    artifacts:
+      - out/*.ipa
+      - out/inspection.txt
