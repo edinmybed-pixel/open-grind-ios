@@ -1,0 +1,34 @@
+name: Build Open Grind IPA
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Select required Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.0.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-build-version
+          test "$(uname -m)" = arm64
+      - uses: cachix/install-nix-action@v31
+      - uses: oven-sh/setup-bun@v2
+      - name: Clone upstream
+        run: |
+          git clone --recursive https://git.opengrind.org/open-grind/open-grind.git "$HOME/Applications/open-grind"
+          cd "$HOME/Applications/open-grind"
+          git rev-parse HEAD
+      - name: Build IPA
+        run: |
+          cd "$HOME/Applications/open-grind"
+          bun run package:ios
+          mkdir -p "$RUNNER_TEMP/ipa"
+          cp src-tauri/target/release/artifacts/*.ipa "$RUNNER_TEMP/ipa/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-grind-ios
+          path: ${{ runner.temp }}/ipa/*.ipa
+          if-no-files-found: error
