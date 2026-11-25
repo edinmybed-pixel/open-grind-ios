@@ -1,36 +1,132 @@
 name: Build Open Grind IPA
+
 on:
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream branch, tag or commit to build"
+        required: true
+        default: "main"
+
 permissions:
   contents: read
+
+concurrency:
+  group: build-ios
+  cancel-in-progress: false
+
 jobs:
   build:
+    # GitHub-hosted Xcode 27 image (arm64, macOS 27). It ships Xcode 27.0
+    # build 27A266a, the exact build upstream pins for the sideload IPA.
     runs-on: xcode-27
-    timeout-minutes: 60
+    timeout-minutes: 150
+    env:
+      UPSTREAM_URL: https://git.opengrind.org/open-grind/open-grind.git
+      SRC: ${{ github.workspace }}/open-grind
+      PINNED_XCODE_BUILD: 27A266a
+      PINNED_SDK_BUILD: 24A430
     steps:
-      - name: Select required Xcode
+      - name: Select Xcode 27.0 and check the host
         run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
           sudo xcode-select -s /Applications/Xcode_27.0.app/Contents/Developer
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-build-version
-          test "$(uname -m)" = arm64
+          xcode_build=$(xcodebuild -version | awk '/Build version/ {print $3}')
+          sdk_build=$(xcrun --sdk iphoneos --show-sdk-build-version)
+          echo "Xcode build: $xcode_build  iOS SDK build: $sdk_build"
+          if [ "$xcode_build" != "$PINNED_XCODE_BUILD" ]; then
+            echo "::error::Xcode build is $xcode_build, upstream needs $PINNED_XCODE_BUILD"
+            exit 1
+          fi
+          echo "SDK_BUILD=$sdk_build" >> "$GITHUB_ENV"
+          sw_vers
+          sysctl -n hw.ncpu hw.memsize
+          df -h "$GITHUB_WORKSPACE"
+
       - uses: cachix/install-nix-action@v31
-      - uses: oven-sh/setup-bun@v2
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Clone upstream
+        env:
+          REF: ${{ inputs.upstream_ref }}
         run: |
-          mkdir -p "$HOME/Applications"
-          git clone --recursive https://git.opengrind.org/open-grind/open-grind.git "$HOME/Applications/open-grind"
-          cd "$HOME/Applications/open-grind"
-          git rev-parse HEAD
-      - name: Build IPA
+          set -euo pipefail
+          # Full clone: nix reads the flake through libgit2, which rejects
+          # shallow and partial clones.
+          git clone "$UPSTREAM_URL" "$SRC"
+          cd "$SRC"
+          git checkout --quiet "$REF"
+          git submodule update --init --recursive
+          git log -1 --format='Building upstream %H (%cd) %s'
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Accept the runner's iOS SDK build if it differs from the pin
+        if: env.SDK_BUILD != env.PINNED_SDK_BUILD
+        working-directory: ${{ env.SRC }}
         run: |
-          cd "$HOME/Applications/open-grind"
-          bun run package:ios
-          mkdir -p "$RUNNER_TEMP/ipa"
-          find . -type f -name "*.ipa" -exec cp {} "$RUNNER_TEMP/ipa/" \\;
-          ls -l "$RUNNER_TEMP/ipa"
+          set -euo pipefail
+          echo "::warning::iOS SDK build is $SDK_BUILD, upstream pins $PINNED_SDK_BUILD. The IPA still works for sideloading but won't be byte-identical to an official one."
+          sed -i '' "s/IPHONEOS_SDK_BUILD = \"$PINNED_SDK_BUILD\"/IPHONEOS_SDK_BUILD = \"$SDK_BUILD\"/" scripts/ios/sideload.ts
+          grep -n IPHONEOS_SDK_BUILD scripts/ios/sideload.ts
+          # The nix build refuses a dirty checkout, so record the change.
+          git -c user.name=ci -c user.email=ci@localhost commit -qam "ci: accept iOS SDK $SDK_BUILD"
+
+      - name: Build sideload IPA (nix run .#build-ios)
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          nix run .#build-ios
+          echo "build took $(( ($(date +%s) - start) / 60 )) min"
+
+      - name: Inspect IPA
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ipas=(src-tauri/target/release/artifacts/*.ipa)
+          if [ ${#ipas[@]} -ne 1 ]; then
+            echo "::error::expected exactly one IPA, found ${#ipas[@]}"
+            ls -la src-tauri/target/release/artifacts || true
+            exit 1
+          fi
+          ipa="${ipas[0]}"
+          out="$RUNNER_TEMP/ipa"
+          mkdir -p "$out"
+          cp "$ipa" "$out/"
+          name=$(basename "$ipa")
+          check="$RUNNER_TEMP/check"
+          rm -rf "$check"; mkdir -p "$check"
+          unzip -q "$ipa" -d "$check"
+          app=$(find "$check/Payload" -maxdepth 1 -name '*.app' -type d | head -1)
+          exe=$(plutil -extract CFBundleExecutable raw -o - "$app/Info.plist")
+          {
+            echo "IPA: $name"
+            echo "upstream: $UPSTREAM_SHA"
+            echo "size: $(stat -f %z "$ipa") bytes"
+            echo "sha256: $(shasum -a 256 "$ipa" | cut -d' ' -f1)"
+            echo "bundle id: $(plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist")"
+            echo "version: $(plutil -extract CFBundleShortVersionString raw -o - "$app/Info.plist") ($(plutil -extract CFBundleVersion raw -o - "$app/Info.plist"))"
+            echo "min iOS: $(plutil -extract MinimumOSVersion raw -o - "$app/Info.plist")"
+            echo "platform: $(plutil -extract DTPlatformName raw -o - "$app/Info.plist") SDK $(plutil -extract DTSDKBuild raw -o - "$app/Info.plist") Xcode $(plutil -extract DTXcodeBuild raw -o - "$app/Info.plist")"
+            echo "executable: $(file "$app/$exe")"
+            echo "archs: $(lipo -archs "$app/$exe")"
+            echo "mach-o platform:"; otool -l "$app/$exe" | grep -A4 LC_BUILD_VERSION | head -5
+            echo "signature:"; codesign -dv "$app" 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier' || true
+          } | tee "$out/inspection.txt"
+          lipo -archs "$app/$exe" | grep -qw arm64
+          otool -l "$app/$exe" | grep -A4 LC_BUILD_VERSION | grep -qE 'platform (2|IOS)\b'
+          codesign --verify --deep --strict "$app"
+          { echo '```'; cat "$out/inspection.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: open-grind-ios
-          path: ${{ runner.temp }}/ipa/*.ipa
+          path: |
+            ${{ runner.temp }}/ipa/*.ipa
+            ${{ runner.temp }}/ipa/inspection.txt
           if-no-files-found: error
+          retention-days: 30
